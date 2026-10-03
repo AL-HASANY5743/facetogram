@@ -8,8 +8,6 @@ on:
 permissions:
   contents: write
 
-author: GitHub Actions
-
 concurrency:
   group: facebook-to-telegram
   cancel-in-progress: true
