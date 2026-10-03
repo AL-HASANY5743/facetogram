@@ -1,15 +1,17 @@
 import base64
+import binascii
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 from typing import Any
+
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state.json"
+DEBUG_DIR = ROOT / ".runtime" / "debug"
 
 
 def env_or_config(config: dict, key: str, env_name: str, default=""):
@@ -38,11 +40,10 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
-    # Keep the state small.
     state["sent_post_ids"] = state.get("sent_post_ids", [])[-5000:]
     STATE_FILE.write_text(
         json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
@@ -56,10 +57,15 @@ def decode_storage_state() -> Path:
             "FACEBOOK_STORAGE_STATE_B64 is missing and local session file was not found."
         )
 
+    # Accept a value copied from PowerShell even if accidental whitespace/newlines exist.
+    b64 = re.sub(r"\s+", "", b64)
     target_dir = ROOT / ".runtime"
     target_dir.mkdir(exist_ok=True)
     target = target_dir / "facebook_storage_state.json"
-    target.write_bytes(base64.b64decode(b64))
+    try:
+        target.write_bytes(base64.b64decode(b64, validate=True))
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError("FACEBOOK_STORAGE_STATE_B64 is not valid Base64.") from exc
     return target
 
 
@@ -69,18 +75,31 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def absolute_facebook_url(href: str) -> str:
+    if href.startswith("/"):
+        return "https://www.facebook.com" + href
+    return href
+
+
 def find_post_link(article) -> str:
-    candidates = []
+    """Find common Facebook post/permalink URLs without depending on one DOM shape."""
+    candidates: list[str] = []
     try:
-        links = article.locator("a").all()
-        for a in links:
-            href = a.get_attribute("href") or ""
+        for a in article.locator("a[href]").all():
+            href = (a.get_attribute("href") or "").strip()
             if not href:
                 continue
-            if any(x in href for x in ("/posts/", "/permalink/", "/groups/")):
-                if href.startswith("/"):
-                    href = "https://www.facebook.com" + href
-                candidates.append(href.split("?")[0])
+            href = absolute_facebook_url(href)
+            lower = href.lower()
+            if (
+                "/posts/" in lower
+                or "/permalink/" in lower
+                or "story_fbid=" in lower
+                or "pfbid" in lower
+            ):
+                clean = href.split("?")[0]
+                if clean not in candidates:
+                    candidates.append(clean)
     except Exception:
         pass
     return candidates[0] if candidates else ""
@@ -89,14 +108,18 @@ def find_post_link(article) -> str:
 def post_id_from_url(url: str) -> str:
     if not url:
         return ""
-    # Stable enough for common Facebook group post URLs.
-    m = re.search(r"/posts/([^/?#]+)", url)
-    if m:
-        return "posts:" + m.group(1)
-    m = re.search(r"/permalink/([^/?#]+)", url)
-    if m:
-        return "permalink:" + m.group(1)
-    # Fallback to normalized URL.
+
+    patterns = [
+        r"/posts/([^/?#]+)",
+        r"/permalink/([^/?#]+)",
+        r"story_fbid=([^&#]+)",
+        r"(pfbid[A-Za-z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url, flags=re.IGNORECASE)
+        if m:
+            return f"facebook:{m.group(1)}"
+
     return "url:" + url
 
 
@@ -114,15 +137,14 @@ def extract_post(article) -> dict[str, Any] | None:
     if not post_id:
         return None
 
-    # Avoid treating huge page-level containers as posts.
     if len(text) > 12000:
         text = text[:12000] + "\n…"
 
-    images = []
+    images: list[str] = []
     try:
-        for img in article.locator("img").all():
+        for img in article.locator("img[src]").all():
             src = img.get_attribute("src") or ""
-            if src.startswith("http") and "scontent" in src:
+            if src.startswith("http") and "scontent" in src and src not in images:
                 images.append(src)
     except Exception:
         pass
@@ -131,15 +153,52 @@ def extract_post(article) -> dict[str, Any] | None:
         "id": post_id,
         "url": link,
         "text": text,
-        "image": images[0] if images else ""
+        "image": images[0] if images else "",
     }
+
+
+def write_debug(page, reason: str, group_url: str):
+    """Write non-cookie diagnostics when Facebook returns an unexpected page."""
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        (DEBUG_DIR / "diagnostic.txt").write_text(
+            "\n".join(
+                [
+                    f"reason={reason}",
+                    f"requested_url={group_url}",
+                    f"final_url={page.url}",
+                    f"title={page.title()}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    try:
+        page.screenshot(path=str(DEBUG_DIR / "facebook-page.png"), full_page=True)
+    except Exception as exc:
+        print(f"[WARN] Could not save diagnostic screenshot: {exc}")
+
+
+def looks_like_login_page(page) -> bool:
+    url = page.url.lower()
+    if "/login" in url or "checkpoint" in url or "recover" in url:
+        return True
+
+    try:
+        password = page.locator('input[type="password"]').count()
+        login_button = page.get_by_role("button", name=re.compile(r"log in|تسجيل الدخول", re.I)).count()
+        return password > 0 and login_button > 0
+    except Exception:
+        return False
 
 
 def scrape_posts(group_url: str, session_file: Path, max_posts: int, headless: bool):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=headless,
-            args=["--disable-blink-features=AutomationControlled"]
+            args=["--disable-blink-features=AutomationControlled"],
         )
         context = browser.new_context(
             storage_state=str(session_file),
@@ -153,31 +212,81 @@ def scrape_posts(group_url: str, session_file: Path, max_posts: int, headless: b
         )
 
         page = context.new_page()
+        print(f"[INFO] Opening Facebook group...")
         page.goto(group_url, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(5000)
 
-        try:
-            page.wait_for_timeout(5000)
-            page.locator('[role="article"]').first.wait_for(timeout=15000)
-        except PlaywrightTimeoutError:
-            pass
+        print(f"[INFO] Final URL: {page.url}")
+        print(f"[INFO] Page title: {page.title()}")
 
-        # Scroll a little to let Facebook populate the feed.
-        for _ in range(3):
-            page.mouse.wheel(0, 1800)
-            page.wait_for_timeout(1500)
+        if looks_like_login_page(page):
+            write_debug(page, "Facebook session appears logged out or checkpointed", group_url)
+            browser.close()
+            raise RuntimeError(
+                "Facebook session is not logged in, or Facebook returned a login/checkpoint page. "
+                "Check the diagnostic artifact 'facebook-page.png'."
+            )
 
-        articles = page.locator('[role="article"]').all()
-        posts = []
-        seen = set()
+        if "/groups/" not in page.url.lower():
+            write_debug(page, "Facebook did not stay on the requested group page", group_url)
+            print("[WARN] Facebook did not remain on a /groups/ page.")
 
-        for article in articles:
+        # Let the feed render and load additional posts.
+        for _ in range(5):
+            page.mouse.wheel(0, 1600)
+            page.wait_for_timeout(1800)
+
+        # Facebook's DOM changes frequently. Try the usual article containers first,
+        # then fall back to any element containing a recognizable post URL.
+        selectors = [
+            '[role="article"]',
+            'div[data-pagelet*="FeedUnit"]',
+            'div[data-ad-preview="message"]',
+        ]
+
+        containers = []
+        seen_container_count = set()
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = min(loc.count(), 200)
+                if count and count not in seen_container_count:
+                    print(f"[INFO] Selector {selector}: {count} elements")
+                    seen_container_count.add(count)
+                    containers.extend(loc.nth(i) for i in range(count))
+            except Exception:
+                continue
+
+        posts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for container in containers:
             if len(posts) >= max_posts:
                 break
-            item = extract_post(article)
+            item = extract_post(container)
             if not item or item["id"] in seen:
                 continue
             seen.add(item["id"])
             posts.append(item)
+
+        if not posts:
+            # Diagnostic fallback: count recognizable post links on the page.
+            link_count = 0
+            try:
+                for a in page.locator("a[href]").all():
+                    href = (a.get_attribute("href") or "").lower()
+                    if (
+                        "/posts/" in href
+                        or "/permalink/" in href
+                        or "story_fbid=" in href
+                        or "pfbid" in href
+                    ):
+                        link_count += 1
+            except Exception:
+                pass
+
+            print(f"[INFO] Recognizable Facebook post links on page: {link_count}")
+            write_debug(page, "No candidate posts were extracted", group_url)
 
         browser.close()
         return posts
@@ -195,13 +304,9 @@ def telegram_request(token: str, method: str, payload: dict):
 
 
 def send_post(token: str, chat_id: str, post: dict, prefix: str, send_images: bool):
-    body = post["text"].strip()
-    if not body:
-        body = "(منشور بدون نص)"
-
+    body = post["text"].strip() or "(منشور بدون نص)"
     message = f"{prefix}{body}\n\n🔗 {post['url']}"
 
-    # Telegram text messages have a 4096 character limit.
     if len(message) > 4000:
         message = message[:3950] + "\n…\n\n🔗 " + post["url"]
 
@@ -217,7 +322,6 @@ def send_post(token: str, chat_id: str, post: dict, prefix: str, send_images: bo
                     "caption": message[:1020],
                 },
             )
-            # If the text was too long for a caption, send the remainder.
             if len(message) > 1020:
                 telegram_request(
                     token,
@@ -253,21 +357,10 @@ def main():
     if not chat_id:
         raise RuntimeError("TELEGRAM_CHAT_ID is missing.")
 
-    max_posts = int(
-        os.getenv("MAX_POSTS", config.get("max_posts", 10))
-    )
-    headless = os.getenv(
-        "HEADLESS",
-        str(config.get("headless", True))
-    ).lower() != "false"
-    send_images = os.getenv(
-        "SEND_IMAGES",
-        str(config.get("send_images", True))
-    ).lower() != "false"
-    prefix = os.getenv(
-        "MESSAGE_PREFIX",
-        config.get("message_prefix", "")
-    )
+    max_posts = int(os.getenv("MAX_POSTS", config.get("max_posts", 10)))
+    headless = os.getenv("HEADLESS", str(config.get("headless", True))).lower() != "false"
+    send_images = os.getenv("SEND_IMAGES", str(config.get("send_images", True))).lower() != "false"
+    prefix = os.getenv("MESSAGE_PREFIX", config.get("message_prefix", ""))
 
     session_file = decode_storage_state()
     state = load_state()
@@ -279,7 +372,6 @@ def main():
 
     new_posts = [p for p in posts if p["id"] not in sent]
 
-    # Process oldest-to-newest among the discovered feed items.
     for post in reversed(new_posts):
         print(f"[INFO] Sending {post['id']}")
         send_post(token, chat_id, post, prefix, send_images)
