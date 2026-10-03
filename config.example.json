@@ -1,0 +1,9 @@
+{
+  "facebook_group_url": "https://www.facebook.com/groups/YOUR_GROUP",
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "max_posts": 10,
+  "headless": true,
+  "send_images": true,
+  "message_prefix": ""
+}
