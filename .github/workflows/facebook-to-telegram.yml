@@ -8,6 +8,8 @@ on:
 permissions:
   contents: write
 
+author: GitHub Actions
+
 concurrency:
   group: facebook-to-telegram
   cancel-in-progress: true
@@ -45,7 +47,17 @@ jobs:
           SEND_IMAGES: "true"
         run: python main.py
 
+      - name: Upload Facebook diagnostics
+        if: always() && hashFiles('.runtime/debug/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: facebook-diagnostics
+          path: .runtime/debug/
+          if-no-files-found: ignore
+          retention-days: 2
+
       - name: Save state
+        if: success()
         run: |
           if git diff --quiet -- state.json; then
             echo "No state changes."
